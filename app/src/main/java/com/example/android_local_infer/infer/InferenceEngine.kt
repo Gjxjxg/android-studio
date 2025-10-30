@@ -138,12 +138,24 @@ class InferenceEngine(private val ctx: Context) {
     /** NNAPI: Some models/ROMs may fail; if failed, return null */
     private fun buildNnapiDelegateOrNull(): NnApiDelegate? {
         return try {
-            NnApiDelegate()
+            try {
+                val optCls = Class.forName("org.tensorflow.lite.nnapi.NnApiDelegate\$Options")
+                val opts = optCls.getDeclaredConstructor().newInstance().apply {
+
+                    runCatching { optCls.getMethod("setAllowFp16", Boolean::class.javaPrimitiveType).invoke(this, true) }
+                    runCatching { optCls.getMethod("setUseNnapiCpu", Boolean::class.javaPrimitiveType).invoke(this, false) }
+                }
+                val ctor = Class.forName("org.tensorflow.lite.nnapi.NnApiDelegate").getDeclaredConstructor(optCls)
+                ctor.newInstance(opts) as NnApiDelegate
+            } catch (_: Throwable) {
+                NnApiDelegate()
+            }
         } catch (t: Throwable) {
-            Log.w(TAG, "NNAPI delegate creation failed", t)
+            Log.w(TAG, "NNAPI delegate creation failed; fallback to CPU", t)
             null
         }
     }
+
 
     /**
      * Run inference
