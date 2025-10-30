@@ -3,147 +3,78 @@ package com.example.android_local_infer.infer
 import android.content.Context
 import android.os.SystemClock
 import android.util.Log
-import org.tensorflow.lite.Delegate
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.gpu.CompatibilityList
-import org.tensorflow.lite.gpu.GpuDelegate
-import org.tensorflow.lite.gpu.GpuDelegateFactory
 import org.tensorflow.lite.nnapi.NnApiDelegate
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.nio.MappedByteBuffer
-import java.util.concurrent.atomic.AtomicReference
 import java.nio.channels.FileChannel
+import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "InferenceEngine"
 
-class InferenceEngine(private val ctx: Context) {
 
-    enum class DelegateMode { CPU, NNAPI, GPU;
-        companion object {
-            fun from(name: String): DelegateMode = when (name.lowercase()) {
-                "nnapi" -> NNAPI
-                "gpu" -> GPU
-                else -> CPU
-            }
+enum class DelegateMode { CPU, NNAPI, GPU }
+
+
+sealed class ModelCfg(val name: String, val file: String, val inputSize: Int) {
+    object MV3   : ModelCfg("mv3",  "mobilenet_v3_small_224_1.0_float.tflite", 224)
+    object Eff0  : ModelCfg("eff0", "efficientnet_lite0_float.tflite",        224)
+    object Eff1  : ModelCfg("eff1", "efficientnet_lite1_float.tflite",        240)
+    object Eff2  : ModelCfg("eff2", "efficientnet_lite2_float.tflite",        260)
+    object Eff3  : ModelCfg("eff3", "efficientnet_lite3_float.tflite",        280)
+    object Eff4  : ModelCfg("eff4", "efficientnet_lite4_float.tflite",        300)
+
+    companion object {
+        fun from(s: String): ModelCfg = when (s.lowercase()) {
+            "eff0" -> Eff0
+            "eff1" -> Eff1
+            "eff2" -> Eff2
+            "eff3" -> Eff3
+            "eff4" -> Eff4
+            "mv3", "mobilenet" -> MV3
+            else -> MV3
         }
+        fun all(): List<ModelCfg> = listOf(MV3, Eff0, Eff1, Eff2, Eff3, Eff4)
     }
+}
 
-    private val model: MappedByteBuffer =
-        AssetLoader.loadModel(ctx, "mobilenet_v3_small_224_1.0_float.tflite")
+class InferenceEngine(
+    private val ctx: Context,
+    private var cfg: ModelCfg = ModelCfg.MV3
+) {
     private val labels: List<String> =
         AssetLoader.loadLabels(ctx, "labels.txt")
 
-    private val interpRef = AtomicReference<Interpreter>()
+    private val interpRef = AtomicReference<Interpreter?>()
     private var current: DelegateMode = DelegateMode.CPU
     private var nnapi: NnApiDelegate? = null
-    private var gpu: Delegate? = null  // It may be a GpuDelegate or a delegate created by Factory
+    private var gpu: GpuDelegate? = null
 
-    /** Create/reuse Interpreter; create delegates according to the pattern,
-     * and fall back to CPU+XNNPACK if failure occurs */
-    private fun buildInterpreter(mode: DelegateMode): Interpreter {
-        interpRef.get()?.let { existing ->
-            if (current == mode) return existing
-            try { existing.close() } catch (_: Throwable) {}
-        }
-        // Clean up old delegates
-        try { nnapi?.close() } catch (_: Throwable) {}
-        try { (gpu as? AutoCloseable)?.close() } catch (_: Throwable) {}
+    @Synchronized fun switchModel(newCfg: ModelCfg) {
+        if (cfg.name == newCfg.name) return
+        Log.i(TAG, "Switching model ${cfg.name} -> ${newCfg.name}")
+        releaseInterpreter()
+        cfg = newCfg
+    }
+
+    private fun releaseInterpreter() {
+        runCatching { interpRef.get()?.close() }.onFailure { }
+        runCatching { nnapi?.close() }.onFailure { }
+        runCatching { gpu?.close() }.onFailure { }
+        interpRef.set(null)
         nnapi = null
         gpu = null
-
-        val opts = Interpreter.Options().apply {
-            // Use XNNPACK when running on the CPU; it can be enabled even if a delegate fails and falls back.
-            setUseXNNPACK(true)
-            setNumThreads(Runtime.getRuntime().availableProcessors().coerceAtMost(4))
-        }
-
-        when (mode) {
-            DelegateMode.CPU -> {
-                Log.i(TAG, "Using CPU (XNNPACK)")
-            }
-            DelegateMode.NNAPI -> {
-                nnapi = buildNnapiDelegateOrNull()
-                if (nnapi != null) {
-                    opts.addDelegate(nnapi)
-                    Log.i(TAG, "Using NNAPI delegate")
-                } else {
-                    Log.w(TAG, "NNAPI not available; fallback to CPU")
-                }
-            }
-            DelegateMode.GPU -> {
-                gpu = buildGpuDelegateOrNull()
-                if (gpu != null) {
-                    opts.addDelegate(gpu)
-                    Log.i(TAG, "Using GPU delegate")
-                } else {
-                    Log.w(TAG, "GPU not available; fallback to CPU")
-                }
-            }
-        }
-
-        val intr = Interpreter(model, opts)
-        interpRef.set(intr)
-        current = mode
-        return intr
+        current = DelegateMode.CPU
     }
 
-    /** GPU: Prioritize Factory API; if the class is missing or not supported, try legacy, and if that fails, return null */
-    private fun buildGpuDelegateOrNull(): Delegate? {
-        return try {
-            val compat = CompatibilityList()
-            if (!compat.isDelegateSupportedOnThisDevice) {
-                Log.w(TAG, "GPU not supported by CompatibilityList; fallback to CPU")
-                return null
-            }
-
-            // 1) Reflection loading GpuDelegateFactory
-            val factoryClass = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory")
-            val factory = factoryClass.getDeclaredConstructor().newInstance()
-
-            // 2) First try the signature create(RuntimeFlavor)
-            try {
-                val flavorClass = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory\$RuntimeFlavor")
-                val best = java.lang.Enum.valueOf(flavorClass as Class<out Enum<*>>, "BEST")
-                val m = factoryClass.getMethod("create", flavorClass)
-                @Suppress("UNCHECKED_CAST")
-                val delegate = m.invoke(factory, best) as Delegate
-                Log.i(TAG, "GPU delegate created via Factory(RuntimeFlavor)")
-                return delegate
-            } catch (_: Throwable) { /* Try again Options version */ }
-
-            // 3) Try the create(Options) signature again
-            try {
-                val optsClass = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory\$Options")
-                val opts = optsClass.getDeclaredConstructor().newInstance()
-                val m = factoryClass.getMethod("create", optsClass)
-                @Suppress("UNCHECKED_CAST")
-                val delegate = m.invoke(factory, opts) as Delegate
-                Log.i(TAG, "GPU delegate created via Factory(Options)")
-                return delegate
-            } catch (_: Throwable) { /* Try legacy again */ }
-
-            // 4) Finally try the old GpuDelegate()
-            try {
-                val legacy = GpuDelegate()
-                Log.i(TAG, "GPU delegate created via legacy GpuDelegate()")
-                legacy
-            } catch (legacy: Throwable) {
-                Log.w(TAG, "Legacy GpuDelegate() failed; fallback to CPU", legacy)
-                null
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "GPU delegate creation failed; fallback to CPU", t)
-            null
-        }
-    }
-    /** NNAPI: Some models/ROMs may fail; if failed, return null */
     private fun buildNnapiDelegateOrNull(): NnApiDelegate? {
         return try {
             try {
                 val optCls = Class.forName("org.tensorflow.lite.nnapi.NnApiDelegate\$Options")
                 val opts = optCls.getDeclaredConstructor().newInstance().apply {
-
                     runCatching { optCls.getMethod("setAllowFp16", Boolean::class.javaPrimitiveType).invoke(this, true) }
                     runCatching { optCls.getMethod("setUseNnapiCpu", Boolean::class.javaPrimitiveType).invoke(this, false) }
+
                 }
                 val ctor = Class.forName("org.tensorflow.lite.nnapi.NnApiDelegate").getDeclaredConstructor(optCls)
                 ctor.newInstance(opts) as NnApiDelegate
@@ -156,65 +87,107 @@ class InferenceEngine(private val ctx: Context) {
         }
     }
 
+    private fun buildGpuDelegateOrNull(): GpuDelegate? {
+        return try {
+            try {
 
-    /**
-     * Run inference
-     * @return Pair(topk result (label, probability), timing in milliseconds)
-     */
+                val factoryCls = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory")
+                val flavorCls  = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory\$RuntimeFlavor")
+                val best      = flavorCls.getField("BEST").get(null)
+                val create    = factoryCls.getMethod("create", flavorCls)
+                val factory   = factoryCls.getDeclaredConstructor().newInstance()
+                create.invoke(factory, best) as GpuDelegate
+            } catch (_: Throwable) {
+
+                GpuDelegate()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "GPU delegate creation failed; fallback to CPU", t)
+            null
+        }
+    }
+
+    private fun loadModelMapped(): MappedByteBuffer =
+        ctx.assets.openFd(cfg.file).use { fd ->
+            FileChannel.MapMode.READ_ONLY.let { mode ->
+                fd.createInputStream().channel.map(mode, fd.startOffset, fd.declaredLength)
+            }
+        }
+
+    @Synchronized
+    private fun ensureInterpreter(mode: DelegateMode): Interpreter {
+        interpRef.get()?.let { if (current == mode) return it }
+
+
+        releaseInterpreter()
+
+        val opts = Interpreter.Options().apply {
+
+            runCatching {
+                val m = this::class.java.getMethod("setUseXNNPACK", Boolean::class.javaPrimitiveType)
+                m.invoke(this, true)
+            }
+
+            runCatching {
+                val m = this::class.java.getMethod("setNumThreads", Int::class.javaPrimitiveType)
+                m.invoke(this, Runtime.getRuntime().availableProcessors().coerceAtMost(4))
+            }
+        }
+
+        when (mode) {
+            DelegateMode.CPU -> { }
+            DelegateMode.NNAPI -> buildNnapiDelegateOrNull()?.let { nnapi = it; opts.addDelegate(it) }
+            DelegateMode.GPU   -> buildGpuDelegateOrNull()?.let { gpu = it; opts.addDelegate(it) }
+        }
+
+        val interpreter = Interpreter(loadModelMapped(), opts)
+        interpRef.set(interpreter)
+        current = mode
+        Log.i(TAG, "Interpreter created: model=${cfg.name}, backend=$current, input=${cfg.inputSize}")
+        return interpreter
+    }
+
     fun run(imageBytes: ByteArray, topk: Int, mode: DelegateMode)
             : Pair<List<Pair<String, Float>>, Map<String, Double>> {
 
-        val interpreter = buildInterpreter(mode)
+        val interpreter = ensureInterpreter(mode)
 
-        // preprocessing
-        val (tensor, preMs) = ImageUtils.preprocess(imageBytes, 224, 224)
 
-        // The output tensor length is read according to the model to avoid out-of-bounds
-        val outTensor = interpreter.getOutputTensor(0)
-        val outElems = outTensor.numElements()  // Usually 1001
-        val output = Array(1) { FloatArray(outElems) }
+        val in0 = interpreter.getInputTensor(0)
+        val shape = in0.shape()
+        val h = shape[1]
+        val w = shape[2]
 
-        val t0 = SystemClock.elapsedRealtimeNanos()
-        interpreter.run(tensor, output)
-        val t1 = SystemClock.elapsedRealtimeNanos()
+        val (inputTensor, preMs) = ImageUtils.preprocess(imageBytes, w, h)
+
+        val out0 = interpreter.getOutputTensor(0)
+        val outLen = out0.numElements()
+        val output = Array(1) { FloatArray(outLen) }
+
+        val t0 = android.os.SystemClock.elapsedRealtimeNanos()
+        interpreter.run(inputTensor, output)
+        val t1 = android.os.SystemClock.elapsedRealtimeNanos()
 
         val probs = output[0]
         val top = TopK.topK(probs, labels, topk)
 
-        val timing = mapOf(
-            "preprocess" to preMs,
-            "infer" to ((t1 - t0) / 1e6),
-            "total" to (preMs + (t1 - t0) / 1e6)
-        )
+        val inferMs = (t1 - t0) / 1e6
+        val timing = mapOf("preprocess" to preMs, "infer" to inferMs, "total" to preMs + inferMs)
         return top to timing
     }
+
 }
 
-/* ---------- helpers ---------- */
 
 private object AssetLoader {
-    fun loadModel(ctx: Context, filename: String): MappedByteBuffer =
-        ctx.assets.openFd(filename).use { fd ->
-            fd.createInputStream().channel.map(
-                FileChannel.MapMode.READ_ONLY,
-                fd.startOffset, fd.declaredLength
-            )
-        }
-
     fun loadLabels(ctx: Context, filename: String): List<String> =
-        ctx.assets.open(filename).bufferedReader().readLines()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
+        ctx.assets.open(filename).bufferedReader().readLines().filter { it.isNotBlank() }
 }
 
 object TopK {
-    fun topK(probs: FloatArray, labels: List<String>, k: Int): List<Pair<String, Float>> {
-        return probs.withIndex()
+    fun topK(probs: FloatArray, labels: List<String>, k: Int): List<Pair<String, Float>> =
+        probs.withIndex()
             .sortedByDescending { it.value }
             .take(k)
-            .map { idx ->
-                val label = labels.getOrNull(idx.index) ?: "class_${idx.index}"
-                label to idx.value
-            }
-    }
+            .map { (i, p) -> (labels.getOrNull(i) ?: "class_$i") to p }
 }
