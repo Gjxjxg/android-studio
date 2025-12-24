@@ -6,12 +6,12 @@ import android.util.Log
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.nnapi.NnApiDelegate
 import org.tensorflow.lite.gpu.GpuDelegate
+import java.nio.ByteBuffer
 import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "InferenceEngine"
-
 
 enum class DelegateMode { CPU, NNAPI, GPU }
 
@@ -34,6 +34,7 @@ sealed class ModelCfg(val name: String, val file: String, val inputSize: Int) {
             "mv3", "mobilenet" -> MV3
             else -> MV3
         }
+
         fun all(): List<ModelCfg> = listOf(MV3, Eff0, Eff1, Eff2, Eff3, Eff4)
     }
 }
@@ -50,17 +51,27 @@ class InferenceEngine(
     private var nnapi: NnApiDelegate? = null
     private var gpu: GpuDelegate? = null
 
-    @Synchronized fun switchModel(newCfg: ModelCfg) {
+
+    @Volatile private var cachedInput: ByteBuffer? = null
+    @Volatile private var cachedW: Int = -1
+    @Volatile private var cachedH: Int = -1
+
+    @Synchronized
+    fun switchModel(newCfg: ModelCfg) {
         if (cfg.name == newCfg.name) return
         Log.i(TAG, "Switching model ${cfg.name} -> ${newCfg.name}")
         releaseInterpreter()
         cfg = newCfg
+
+        cachedInput = null
+        cachedW = -1
+        cachedH = -1
     }
 
     private fun releaseInterpreter() {
-        runCatching { interpRef.get()?.close() }.onFailure { }
-        runCatching { nnapi?.close() }.onFailure { }
-        runCatching { gpu?.close() }.onFailure { }
+        runCatching { interpRef.get()?.close() }
+        runCatching { nnapi?.close() }
+        runCatching { gpu?.close() }
         interpRef.set(null)
         nnapi = null
         gpu = null
@@ -74,7 +85,6 @@ class InferenceEngine(
                 val opts = optCls.getDeclaredConstructor().newInstance().apply {
                     runCatching { optCls.getMethod("setAllowFp16", Boolean::class.javaPrimitiveType).invoke(this, true) }
                     runCatching { optCls.getMethod("setUseNnapiCpu", Boolean::class.javaPrimitiveType).invoke(this, false) }
-
                 }
                 val ctor = Class.forName("org.tensorflow.lite.nnapi.NnApiDelegate").getDeclaredConstructor(optCls)
                 ctor.newInstance(opts) as NnApiDelegate
@@ -90,15 +100,13 @@ class InferenceEngine(
     private fun buildGpuDelegateOrNull(): GpuDelegate? {
         return try {
             try {
-
                 val factoryCls = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory")
                 val flavorCls  = Class.forName("org.tensorflow.lite.gpu.GpuDelegateFactory\$RuntimeFlavor")
-                val best      = flavorCls.getField("BEST").get(null)
-                val create    = factoryCls.getMethod("create", flavorCls)
-                val factory   = factoryCls.getDeclaredConstructor().newInstance()
+                val best       = flavorCls.getField("BEST").get(null)
+                val create     = factoryCls.getMethod("create", flavorCls)
+                val factory    = factoryCls.getDeclaredConstructor().newInstance()
                 create.invoke(factory, best) as GpuDelegate
             } catch (_: Throwable) {
-
                 GpuDelegate()
             }
         } catch (t: Throwable) {
@@ -109,15 +117,16 @@ class InferenceEngine(
 
     private fun loadModelMapped(): MappedByteBuffer =
         ctx.assets.openFd(cfg.file).use { fd ->
-            FileChannel.MapMode.READ_ONLY.let { mode ->
-                fd.createInputStream().channel.map(mode, fd.startOffset, fd.declaredLength)
-            }
+            fd.createInputStream().channel.map(
+                FileChannel.MapMode.READ_ONLY,
+                fd.startOffset,
+                fd.declaredLength
+            )
         }
 
     @Synchronized
     private fun ensureInterpreter(mode: DelegateMode): Interpreter {
         interpRef.get()?.let { if (current == mode) return it }
-
 
         releaseInterpreter()
 
@@ -127,7 +136,6 @@ class InferenceEngine(
                 val m = this::class.java.getMethod("setUseXNNPACK", Boolean::class.javaPrimitiveType)
                 m.invoke(this, true)
             }
-
             runCatching {
                 val m = this::class.java.getMethod("setNumThreads", Int::class.javaPrimitiveType)
                 m.invoke(this, Runtime.getRuntime().availableProcessors().coerceAtMost(4))
@@ -135,7 +143,7 @@ class InferenceEngine(
         }
 
         when (mode) {
-            DelegateMode.CPU -> { }
+            DelegateMode.CPU -> Unit
             DelegateMode.NNAPI -> buildNnapiDelegateOrNull()?.let { nnapi = it; opts.addDelegate(it) }
             DelegateMode.GPU   -> buildGpuDelegateOrNull()?.let { gpu = it; opts.addDelegate(it) }
         }
@@ -147,37 +155,84 @@ class InferenceEngine(
         return interpreter
     }
 
+
+    private fun getOrCreateInput(imageBytes: ByteArray, w: Int, h: Int): Pair<ByteBuffer, Double> {
+        val buf = cachedInput
+        if (buf != null && cachedW == w && cachedH == h) {
+            buf.rewind()
+            return buf to 0.0
+        }
+        val (newBuf, preMs) = ImageUtils.preprocess(imageBytes, w, h)
+        cachedInput = newBuf
+        cachedW = w
+        cachedH = h
+        return newBuf to preMs
+    }
+
+
     fun run(imageBytes: ByteArray, topk: Int, mode: DelegateMode)
             : Pair<List<Pair<String, Float>>, Map<String, Double>> {
 
         val interpreter = ensureInterpreter(mode)
-
 
         val in0 = interpreter.getInputTensor(0)
         val shape = in0.shape()
         val h = shape[1]
         val w = shape[2]
 
-        val (inputTensor, preMs) = ImageUtils.preprocess(imageBytes, w, h)
+        val (inputTensor, preMs) = getOrCreateInput(imageBytes, w, h)
 
         val out0 = interpreter.getOutputTensor(0)
         val outLen = out0.numElements()
         val output = Array(1) { FloatArray(outLen) }
 
-        val t0 = android.os.SystemClock.elapsedRealtimeNanos()
+        val t0 = SystemClock.elapsedRealtimeNanos()
         interpreter.run(inputTensor, output)
-        val t1 = android.os.SystemClock.elapsedRealtimeNanos()
+        val t1 = SystemClock.elapsedRealtimeNanos()
 
         val probs = output[0]
         val top = TopK.topK(probs, labels, topk)
 
         val inferMs = (t1 - t0) / 1e6
-        val timing = mapOf("preprocess" to preMs, "infer" to inferMs, "total" to preMs + inferMs)
+        val timing = mapOf("preprocess" to preMs, "infer" to inferMs, "total" to (preMs + inferMs))
         return top to timing
     }
 
-}
 
+    fun runLoop(imageBytes: ByteArray, loops: Int, mode: DelegateMode): Map<String, Any> {
+        val interpreter = ensureInterpreter(mode)
+
+        val in0 = interpreter.getInputTensor(0)
+        val shape = in0.shape()
+        val h = shape[1]
+        val w = shape[2]
+
+        val (inputTensor, preMs) = getOrCreateInput(imageBytes, w, h)
+
+        val out0 = interpreter.getOutputTensor(0)
+        val outLen = out0.numElements()
+        val output = Array(1) { FloatArray(outLen) }
+
+        repeat(5) {
+            inputTensor.rewind()
+            interpreter.run(inputTensor, output)
+        }
+
+        val t0 = SystemClock.elapsedRealtime()
+        repeat(loops) {
+            inputTensor.rewind()
+            interpreter.run(inputTensor, output)
+        }
+        val t1 = SystemClock.elapsedRealtime()
+
+        return mapOf(
+            "preprocess_ms" to preMs,
+            "loops" to loops,
+            "elapsed_ms" to (t1 - t0),
+            "avg_ms_per_infer" to ((t1 - t0).toDouble() / loops.toDouble())
+        )
+    }
+}
 
 private object AssetLoader {
     fun loadLabels(ctx: Context, filename: String): List<String> =

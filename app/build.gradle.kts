@@ -55,6 +55,7 @@ dependencies {
     implementation("io.ktor:ktor-server-content-negotiation:$ktor")
     implementation("io.ktor:ktor-serialization-jackson:$ktor")
 
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.+")
     // Optional: Remove SLF4J prompt (can run without it)
     // implementation("org.slf4j:slf4j-android:1.7.36")
 

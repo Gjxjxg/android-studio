@@ -15,6 +15,8 @@ import io.ktor.server.cio.CIO
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import com.fasterxml.jackson.databind.DeserializationFeature
+import com.fasterxml.jackson.module.kotlin.kotlinModule
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -36,7 +38,13 @@ object LocalServer {
         infer = InferenceEngine(ctx, cfg = currentModel)
 
         engine = embeddedServer(CIO, port = 8080) {
-            install(ContentNegotiation) { jackson() }
+            install(ContentNegotiation) {
+                jackson {
+
+                    registerModule(kotlinModule())
+                    configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+                }
+            }
 
             routing {
                 get("/health") { call.respond(mapOf("ok" to true)) }
@@ -82,6 +90,30 @@ object LocalServer {
                         call.respond(HttpStatusCode.BadRequest, mapOf("ok" to false, "error" to (t.message ?: "unknown")))
                     }
                 }
+                post("/infer_loop") {
+                    val req = call.receive<InferRequest>()
+                    val loops = call.request.queryParameters["loops"]?.toInt() ?: 2000
+
+                    val bytes = Base64.decode(req.image_b64, Base64.DEFAULT)
+                    val delegate = (req.delegate ?: currentDelegate.name).lowercase()
+                    val mode = when (delegate) {
+                        "gpu" -> DelegateMode.GPU
+                        "nnapi", "npu" -> DelegateMode.NNAPI
+                        else -> DelegateMode.CPU
+                    }
+
+                    val elapsed = infer.runLoop(bytes, loops, mode)
+
+                    call.respond(
+                        mapOf(
+                            "ok" to true,
+                            "delegate" to mode.name,
+                            "loops" to loops,
+                            "elapsed_ms" to elapsed
+                        )
+                    )
+                }
+
             }
         }
 

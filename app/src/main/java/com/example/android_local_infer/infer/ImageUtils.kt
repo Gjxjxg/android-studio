@@ -8,10 +8,7 @@ import java.nio.ByteOrder
 import kotlin.math.min
 
 object ImageUtils {
-    /**
-     * Convert any image bytes to 224x224 float32 NHWC, [0,1] normalized ByteBuffer
-     * @return Pair(ByteBuffer, Preprocessing takes time ms)
-     */
+
     fun preprocess(bytes: ByteArray, dstW: Int, dstH: Int): Pair<ByteBuffer, Double> {
         val t0 = SystemClock.elapsedRealtimeNanos()
 
