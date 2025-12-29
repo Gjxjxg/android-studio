@@ -12,7 +12,7 @@ import java.nio.channels.FileChannel
 import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "InferenceEngine"
-
+private const val ENABLE_PREPROCESS_CACHE = false
 enum class DelegateMode { CPU, NNAPI, GPU }
 
 
@@ -156,18 +156,32 @@ class InferenceEngine(
     }
 
 
-    private fun getOrCreateInput(imageBytes: ByteArray, w: Int, h: Int): Pair<ByteBuffer, Double> {
-        val buf = cachedInput
-        if (buf != null && cachedW == w && cachedH == h) {
-            buf.rewind()
-            return buf to 0.0
+    private fun getOrCreateInput(
+        imageBytes: ByteArray,
+        w: Int,
+        h: Int
+    ): Pair<ByteBuffer, Double> {
+
+        if (ENABLE_PREPROCESS_CACHE) {
+            val buf = cachedInput
+            if (buf != null && cachedW == w && cachedH == h) {
+                buf.rewind()
+                return buf to 0.0
+            }
         }
+
+        // always do real preprocess when cache is disabled
         val (newBuf, preMs) = ImageUtils.preprocess(imageBytes, w, h)
-        cachedInput = newBuf
-        cachedW = w
-        cachedH = h
+
+        if (ENABLE_PREPROCESS_CACHE) {
+            cachedInput = newBuf
+            cachedW = w
+            cachedH = h
+        }
+
         return newBuf to preMs
     }
+
 
 
     fun run(imageBytes: ByteArray, topk: Int, mode: DelegateMode)
